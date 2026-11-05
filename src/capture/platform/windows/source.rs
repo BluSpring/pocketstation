@@ -51,6 +51,7 @@ use crate::frame::{
     SAMPLE_RATE_HZ,
 };
 use wasapi::{AudioClient, DeviceEnumerator, Direction, SampleType, StreamMode, WaveFormat};
+use windows::Win32::Media::Audio::{EDataFlow, DEVICE_STATE_ACTIVE};
 use windows::Win32::System::Performance::{QueryPerformanceCounter, QueryPerformanceFrequency};
 
 use crate::capture::frame_normalizer::CaptureFrameNormalizer;
@@ -2157,112 +2158,124 @@ unsafe fn enumerate_wasapi_sessions() -> Vec<crate::capture::CaptureSource> {
             Err(_) => return Vec::new(),
         };
 
-    let device = match enumerator.GetDefaultAudioEndpoint(eRender, eMultimedia) {
-        Ok(d) => d,
-        Err(_) => return Vec::new(),
-    };
-
-    let session_manager: IAudioSessionManager2 = match device.Activate(CLSCTX_ALL, None) {
-        Ok(sm) => sm,
-        Err(_) => return Vec::new(),
-    };
-
-    let session_enum: IAudioSessionEnumerator = match session_manager.GetSessionEnumerator() {
-        Ok(se) => se,
-        Err(_) => return Vec::new(),
-    };
-
-    let count = match session_enum.GetCount() {
+    let devices = match enumerator.EnumAudioEndpoints(eRender, DEVICE_STATE_ACTIVE) {
         Ok(c) => c,
         Err(_) => return Vec::new(),
     };
 
-    let mut sources: Vec<CaptureSource> = Vec::with_capacity(count as usize);
+    let device_count = match devices.GetCount() {
+        Ok(c) => c,
+        Err(_) => return Vec::new(),
+    };
 
-    for i in 0..count {
-        let ctrl: IAudioSessionControl = match session_enum.GetSession(i) {
+    let mut sources = Vec::<CaptureSource>::new();
+
+    for i in 0..device_count {
+        let device = match devices.Item(i) {
+            Ok(d) => d,
+            Err(_) => continue,
+        };
+
+        let session_manager: IAudioSessionManager2 = match device.Activate(CLSCTX_ALL, None) {
+            Ok(sm) => sm,
+            Err(_) => return Vec::new(),
+        };
+
+        let session_enum: IAudioSessionEnumerator = match session_manager.GetSessionEnumerator() {
+            Ok(se) => se,
+            Err(_) => return Vec::new(),
+        };
+
+        let count = match session_enum.GetCount() {
             Ok(c) => c,
-            Err(_) => continue,
-        };
-        let ctrl2: IAudioSessionControl2 = match ctrl.cast() {
-            Ok(c) => c,
-            Err(_) => continue,
+            Err(_) => return Vec::new(),
         };
 
-        let pid = match ctrl2.GetProcessId() {
-            Ok(p) => p,
-            Err(_) => continue,
-        };
-
-        // Skip system/idle sessions and our own process.
-        if pid == 0 || pid == current_pid {
-            continue;
-        }
-        let process_instance = match query_process_creation_time_100ns(pid) {
-            Ok(creation_time_100ns) => ProcessInstanceFingerprint::new(pid, creation_time_100ns),
-            Err(_) => continue,
-        };
-
-        let state = match ctrl.GetState() {
-            Ok(s) => s,
-            Err(_) => continue,
-        };
-        let source_state = if state == AudioSessionStateActive {
-            SourceState::Playing
-        } else {
-            SourceState::Silent
-        };
-
-        // Resolve the display name and the native application identity from
-        // the same process incarnation used to create the source identity.
-        let (name, application_id) =
-            match OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) {
-                Ok(handle) => {
-                    let mut buf = vec![0u16; 260];
-                    let mut len = buf.len() as u32;
-                    let application_id = query_process_application_id(handle);
-                    let name_result = QueryFullProcessImageNameW(
-                        handle,
-                        PROCESS_NAME_WIN32,
-                        PWSTR(buf.as_mut_ptr()),
-                        &mut len,
-                    );
-                    let _ = CloseHandle(handle);
-                    let name = match name_result {
-                        Ok(()) => {
-                            let path = String::from_utf16_lossy(&buf[..len as usize]);
-                            std::path::Path::new(&path)
-                                .file_stem()
-                                .and_then(|s| s.to_str())
-                                .unwrap_or(&path)
-                                .to_owned()
-                        }
-                        Err(_) => format!("pid-{pid}"),
-                    };
-                    (name, application_id)
-                }
-                Err(_) => (format!("pid-{pid}"), None),
+        for i in 0..count {
+            let ctrl: IAudioSessionControl = match session_enum.GetSession(i) {
+                Ok(c) => c,
+                Err(_) => continue,
             };
-        match query_process_creation_time_100ns(pid) {
-            Ok(creation_time_100ns)
-                if creation_time_100ns == process_instance.creation_time_100ns => {}
-            _ => continue,
-        }
+            let ctrl2: IAudioSessionControl2 = match ctrl.cast() {
+                Ok(c) => c,
+                Err(_) => continue,
+            };
 
-        sources.push(CaptureSource {
-            stable_id: StableSourceId::new(
-                Platform::Windows,
-                SourceKind::Application,
-                process_instance.stable_key(),
-            ),
-            name,
-            process_id: Some(pid),
-            app_id: application_id,
-            device_uid: None,
-            state: source_state,
-            sample_rate_hz: 48_000,
-            channels: 2,
-        });
+            let pid = match ctrl2.GetProcessId() {
+                Ok(p) => p,
+                Err(_) => continue,
+            };
+
+            // Skip system/idle sessions and our own process.
+            if pid == 0 || pid == current_pid {
+                continue;
+            }
+            let process_instance = match query_process_creation_time_100ns(pid) {
+                Ok(creation_time_100ns) => ProcessInstanceFingerprint::new(pid, creation_time_100ns),
+                Err(_) => continue,
+            };
+
+            let state = match ctrl.GetState() {
+                Ok(s) => s,
+                Err(_) => continue,
+            };
+            let source_state = if state == AudioSessionStateActive {
+                SourceState::Playing
+            } else {
+                SourceState::Silent
+            };
+
+            // Resolve the display name and the native application identity from
+            // the same process incarnation used to create the source identity.
+            let (name, application_id) =
+                match OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) {
+                    Ok(handle) => {
+                        let mut buf = vec![0u16; 260];
+                        let mut len = buf.len() as u32;
+                        let application_id = query_process_application_id(handle);
+                        let name_result = QueryFullProcessImageNameW(
+                            handle,
+                            PROCESS_NAME_WIN32,
+                            PWSTR(buf.as_mut_ptr()),
+                            &mut len,
+                        );
+                        let _ = CloseHandle(handle);
+                        let name = match name_result {
+                            Ok(()) => {
+                                let path = String::from_utf16_lossy(&buf[..len as usize]);
+                                std::path::Path::new(&path)
+                                    .file_stem()
+                                    .and_then(|s| s.to_str())
+                                    .unwrap_or(&path)
+                                    .to_owned()
+                            }
+                            Err(_) => format!("pid-{pid}"),
+                        };
+                        (name, application_id)
+                    }
+                    Err(_) => (format!("pid-{pid}"), None),
+                };
+            match query_process_creation_time_100ns(pid) {
+                Ok(creation_time_100ns)
+                if creation_time_100ns == process_instance.creation_time_100ns => {}
+                _ => continue,
+            }
+
+            sources.push(CaptureSource {
+                stable_id: StableSourceId::new(
+                    Platform::Windows,
+                    SourceKind::Application,
+                    process_instance.stable_key(),
+                ),
+                name,
+                process_id: Some(pid),
+                app_id: application_id,
+                device_uid: None,
+                state: source_state,
+                sample_rate_hz: 48_000,
+                channels: 2,
+            });
+        }
     }
 
     sources
